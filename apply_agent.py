@@ -28,6 +28,7 @@
 from src.client.naukri_client import NaukriLoginClient
 from src.client.job_client import NaukriJobClient
 from src.client.jop_classifier import JobFilterPipeline2
+from src.client.hirist_client import HiristClient, HiristError, find_hirist_url
 from src.exceptions.exceptions import NaukriAuthError, NaukriParseError
 from dotenv import load_dotenv
 from colorama import Fore, Back, Style, init
@@ -145,10 +146,16 @@ def print_status_applied(applied_at=None) -> None:
     print(f"  {Fore.GREEN}Status  :  Applied successfully{Style.RESET_ALL}{ts}")
 
 
-def print_status_skipped_external() -> None:
+def print_status_skipped_external(url: str | None = None) -> None:
     # External apply jobs cannot be submitted via the API. The URL is printed
     # in the job header so the user can open it manually if needed.
-    print(f"  {Fore.YELLOW}Status  :  Skipped — external apply (open URL manually){Style.RESET_ALL}")
+    suffix = f" — {url}" if url else " (open URL manually)"
+    print(f"  {Fore.YELLOW}Status  :  Skipped — external apply{suffix}{Style.RESET_ALL}")
+
+
+def print_status_hirist_applied(url: str | None = None) -> None:
+    suffix = f" via Hirist ({url})" if url else " via Hirist"
+    print(f"  {Fore.GREEN}Status  :  Applied successfully{suffix}{Style.RESET_ALL}")
 
 
 def print_status_failed(error) -> None:
@@ -205,13 +212,14 @@ def print_fetch_progress(keyword: str, location: str, exp: int, page: int, fetch
     )
 
 
-def print_summary(total_found: int, total_allowed: int, applied: int, skipped_ext: int, failed: int) -> None:
+def print_summary(total_found: int, total_allowed: int, applied: int, skipped_ext: int, failed: int, hirist_applied: int = 0) -> None:
     # Prints the final run summary table. Called once at the end of the script.
     print_section_title("run summary")
     rows = [
         ("Jobs fetched (total unique)", str(total_found),   Fore.WHITE),
         ("Jobs passed AI filter",       str(total_allowed), Fore.CYAN),
         ("Applied successfully",        str(applied),       Fore.GREEN),
+        ("Applied via Hirist",          str(hirist_applied),Fore.GREEN),
         ("Skipped (external apply)",    str(skipped_ext),   Fore.YELLOW),
         ("Failed",                      str(failed),        Fore.RED),
     ]
@@ -227,28 +235,32 @@ def print_summary(total_found: int, total_allowed: int, applied: int, skipped_ex
 # collects results into a deduplicated list.
 #
 # Design decisions:
-#   - Queries are hand-curated for the target stack (Node.js, Python, backend).
-#   - Only Bangalore and Pune are targeted — highest product/startup density.
-#   - Experience is fixed at 2 years. exp=3 pulled in too many senior roles.
-#   - job_age=2 keeps results fresh, which improves apply response rates.
-#   - 1 page per query. Quality drops sharply beyond page 2 on Naukri.
-#   - 1.2s sleep between requests to avoid rate limiting.
+#   - Queries target senior DevOps / SRE / Platform / Architecture / EM roles.
+#   - Experience centered around 8 years.
+#   - job_age keeps results reasonably fresh.
 #   - Deduplication is done by job_id across all queries before returning.
 # ----------------------------------------------------------------------------------
 
 def fetch_all_jobs(jc: NaukriJobClient) -> list:
 
     BQUERIES = [
-        # Tier 1: exact stack match
-        {"keyword": "Node.js backend developer", "location": "Bangalore"},
-        {"keyword": "Python Developer",          "location": ""},
-        {"keyword": "Node.js Developer",         "location": ""},
-        {"keyword": "python backend developer",  "location": "Pune"},
+        {"keyword": "DevOps Manager", "location": ""},
+        {"keyword": "DevSecOps Manager", "location": ""},
+        {"keyword": "SRE Manager", "location": ""},
+        {"keyword": "Site Reliability Engineer", "location": ""},
+        {"keyword": "Platform Engineering Manager", "location": ""},
+        {"keyword": "Platform Engineer", "location": ""},
+        {"keyword": "Cloud Architect", "location": ""},
+        {"keyword": "DevOps Architect", "location": ""},
+        {"keyword": "Engineering Manager DevOps", "location": ""},
+        {"keyword": "Engineering Manager Platform", "location": ""},
+        {"keyword": "Senior DevOps Engineer", "location": ""},
+        {"keyword": "Senior SRE", "location": ""},
     ]
 
-    EXPERIENCE_LEVELS = [2]
+    EXPERIENCE_LEVELS = [8]
     PAGES   = 1
-    JOB_AGE = 2
+    JOB_AGE = 3
 
     seen_ids = set()
     all_jobs = []
@@ -307,8 +319,8 @@ def fetch_all_jobs(jc: NaukriJobClient) -> list:
 
 if __name__ == "__main__":
 
-    username = os.getenv("USERNAME")
-    password = os.getenv("PASSWORD")
+    username = os.getenv("N_USERNAME")
+    password = os.getenv("N_PASSWORD")
     ai_key   = os.getenv("OPEN_API_KEY")
 
     # Step 1: authenticate and establish session.
@@ -316,6 +328,8 @@ if __name__ == "__main__":
     client = NaukriLoginClient(username, password)
     client.login()
     print(f"  {Fore.GREEN}Logged in as {Fore.YELLOW}{username}{Style.RESET_ALL}")
+
+    hirist = HiristClient(username, password)
 
     # Step 2: fetch raw jobs from search API.
     jc   = NaukriJobClient(client)
@@ -343,6 +357,7 @@ if __name__ == "__main__":
     applied_count = 0
     skipped_ext   = 0
     failed_count  = 0
+    hirist_count  = 0
 
     allowed_jobs = [j for j in jobs if j.job_id in allow]
     print_section_title(f"applying to {len(allowed_jobs)} filtered jobs")
@@ -360,16 +375,40 @@ if __name__ == "__main__":
             ai_detail=ai_detail,
         )
 
-        # External apply jobs cannot be submitted via the API, skip them.
-        if jc.is_external_apply(job.job_id):
+        if job.job_id in applied_jobs_set:
+            print(f"  {Fore.YELLOW}Status  :  Skipped — already applied earlier{Style.RESET_ALL}")
+            continue
+
+        # External apply: Hirist is handled automatically; other company sites are skipped.
+        try:
+            external_info = jc.get_external_apply_info(job.job_id)
+        except Exception as e:
+            print_status_failed(f"Could not inspect external apply status: {e}")
+            failed_count += 1
+            continue
+
+        if external_info.get("is_hirist") and external_info.get("hirist_url"):
+            try:
+                hirist.apply_from_url(external_info["hirist_url"])
+                print_status_hirist_applied(external_info["hirist_url"])
+                save_applied_job(job)
+                applied_jobs_set.add(job.job_id)
+                applied_count += 1
+                hirist_count += 1
+            except HiristError as e:
+                print_status_failed(e)
+                failed_count += 1
+            time.sleep(3)
+            continue
+
+        if external_info.get("external"):
             print_status_skipped_external()
             skipped_ext += 1
             continue
 
-        # Use the first two tags as mandatory skills and the rest as optional.
-        # This maps the job's skill tags to the apply payload fields.
-        mandatory = job.tags[:2] if job.tags else []
-        optional  = job.tags[2:] if len(job.tags) > 2 else []
+        # Prefer stable skills for this profile over employer-provided tags.
+        mandatory = ["DevOps", "Kubernetes"]
+        optional  = ["AWS", "Terraform", "SRE", "CI/CD"]
 
         try:
             result   = jc.apply_job(
@@ -378,6 +417,18 @@ if __name__ == "__main__":
                 optional_skills=optional,
                 source="search",
             )
+
+            # Some Naukri flows return Hirist redirect only after the apply call.
+            hirist_url = find_hirist_url(result)
+            if hirist_url:
+                hirist.apply_from_url(hirist_url)
+                print_status_hirist_applied(hirist_url)
+                save_applied_job(job)
+                applied_jobs_set.add(job.job_id)
+                applied_count += 1
+                hirist_count += 1
+                time.sleep(3)
+                continue
 
             job_result = (result.get("jobs") or [{}])[0]
 
@@ -394,6 +445,10 @@ if __name__ == "__main__":
                     optional_skills=optional,
                     source="search",
                 )
+                if isinstance(result, dict) and result.get("success") is False:
+                    print_status_failed(result.get("error"))
+                    failed_count += 1
+                    continue
 
             applied_at = datetime.utcnow().strftime("%H:%M:%S UTC")
             print_status_applied(applied_at)
@@ -415,4 +470,5 @@ if __name__ == "__main__":
         applied=applied_count,
         skipped_ext=skipped_ext,
         failed=failed_count,
+        hirist_applied=hirist_count,
     )

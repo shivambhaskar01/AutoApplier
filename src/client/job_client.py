@@ -1,8 +1,10 @@
 import logging
+import re
 from datetime import datetime
 
 from src.models.models import Job
 from src.client.naukri_client import NaukriLoginClient
+from src.client.hirist_client import find_hirist_url
 from src.exceptions.exceptions import NaukriAuthError, NaukriParseError
 from src.utils.request_helper import with_exponential_retry
 from src.utils.nkparam_generator import generate_nkparam
@@ -17,6 +19,130 @@ _handler.setFormatter(
     logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
 )
 logger.addHandler(_handler)
+
+
+def build_questionnaire_answers(questionnaire: list, profile: dict | None = None) -> dict:
+    """Generate a simple questionnaire answer map for Naukri apply flows."""
+    profile = profile or {
+        "current_ctc": "50",
+        "expected_ctc": "70",
+        "exp_total": "8 years",
+        "exp_node": "8 years",
+        "exp_python": "8 years",
+        "notice_days": 60,
+        "skills": [
+            "docker", "kubernetes", "aws", "azure", "gcp", "ci/cd",
+            "jenkins", "terraform", "devops", "sre", "platform",
+        ],
+    }
+
+    def pick_yes(options: dict) -> str:
+        for k, v in options.items():
+            if "yes" in (v or "").lower():
+                return k
+        return list(options.keys())[0]
+
+    def pick_notice(options: dict, notice_days: int) -> str:
+        for k, v in options.items():
+            val = (v or "").lower()
+            if "15" in val and notice_days <= 15:
+                return k
+            if "1 month" in val and notice_days <= 30:
+                return k
+            if "2 month" in val and notice_days <= 60:
+                return k
+        return list(options.keys())[0]
+
+    def pick_experience_choice(options: dict, target: str) -> str:
+        target = (target or "").lower()
+        for k, v in options.items():
+            label = (v or "").lower()
+            if target in label or ("8" in label and "year" in label):
+                return k
+        # Prefer the highest numeric year bucket when 8 is not listed.
+        best_key = None
+        best_years = -1
+        for k, v in options.items():
+            nums = re.findall(r"\d+", v or "")
+            if nums:
+                years = int(nums[0])
+                if years <= 8 and years > best_years:
+                    best_years = years
+                    best_key = k
+        return best_key or list(options.keys())[0]
+
+    def normalize_experience_value(value: str) -> str:
+        value = str(value or "").strip()
+        if "year" in value.lower() or "yr" in value.lower():
+            return value
+        if value.isdigit():
+            return f"{value} years"
+        return value
+
+    def is_years_experience_question(qtext: str, options: dict) -> bool:
+        yearish = any(
+            ("year" in (v or "").lower()) or ("yr" in (v or "").lower()) or re.search(r"\d+", v or "")
+            for v in options.values()
+        ) if options else False
+        markers = (
+            "total experience",
+            "overall experience",
+            "years of experience",
+            "year of experience",
+            "experience in",
+            "exp in",
+            "how many years",
+            "no. of years",
+            "number of years",
+        )
+        return any(m in qtext for m in markers) or ("experience" in qtext and yearish)
+
+    def is_yes_no_experience_question(qtext: str, options: dict) -> bool:
+        if not options:
+            return False
+        labels = " ".join((v or "").lower() for v in options.values())
+        return "experience" in qtext and ("yes" in labels or "no" in labels) and "year" not in labels
+
+    answers = {}
+
+    for q in questionnaire:
+        qid = q["questionId"]
+        qtext = (q.get("questionName") or "").lower()
+        qtype = (q.get("questionType") or "").lower()
+        options = q.get("answerOption") or {}
+
+        if qtype == "text box":
+            if "current ctc" in qtext:
+                ans = profile["current_ctc"]
+            elif "expected ctc" in qtext:
+                ans = profile["expected_ctc"]
+            elif "experience" in qtext or "exp in" in qtext or "years" in qtext:
+                ans = normalize_experience_value(profile.get("exp_total", "8 years"))
+            elif "notice" in qtext:
+                ans = str(profile["notice_days"])
+            else:
+                ans = "1"
+        else:
+            if options:
+                if "notice" in qtext:
+                    key = pick_notice(options, profile["notice_days"])
+                elif is_years_experience_question(qtext, options):
+                    key = pick_experience_choice(options, profile.get("exp_total", "8 years"))
+                elif is_yes_no_experience_question(qtext, options):
+                    key = pick_yes(options)
+                elif any(skill in qtext for skill in profile["skills"]):
+                    key = pick_yes(options)
+                elif any(x in qtext for x in ["do you", "have you"]):
+                    key = pick_yes(options)
+                else:
+                    key = list(options.keys())[0]
+                ans = [key]
+            else:
+                ans = "1"
+
+        answers[qid] = ans
+
+    return answers
 
 
 APPLY_SRC_MAP = {
@@ -286,6 +412,20 @@ class NaukriJobClient:
         data = self.get_job_details(job_id, sid)
         return data.get("job", {}).get("responseManager") == "companyUrl"
 
+    def get_external_apply_info(self, job_id: str, sid: str = "") -> dict:
+        """Return external-apply metadata, including any Hirist redirect URL."""
+        data = self.get_job_details(job_id, sid)
+        job = data.get("job") or {}
+        hirist_url = find_hirist_url(data)
+        external = job.get("responseManager") == "companyUrl" or bool(hirist_url)
+        return {
+            "external": external,
+            "response_manager": job.get("responseManager"),
+            "hirist_url": hirist_url,
+            "is_hirist": bool(hirist_url),
+            "raw": data,
+        }
+
     # ----------------------------------------------------------------------------------
     # Apply job
     # ----------------------------------------------------------------------------------
@@ -370,84 +510,19 @@ class NaukriJobClient:
         # Static profile values used when generating questionnaire answers.
         # Update these to match the candidate's actual profile.
         PROFILE = {
-            "current_ctc":  "5",
-            "expected_ctc": "7",
-            "exp_total":    "2",
-            "exp_node":     "2",
-            "exp_python":   "1",
-            "notice_days":  30,
+            "current_ctc":  "50",
+            "expected_ctc": "70",
+            "exp_total":    "8 years",
+            "exp_node":     "8 years",
+            "exp_python":   "8 years",
+            "notice_days":  60,
             "skills": [
-                "node", "docker", "kubernetes",
-                "aws", "ci/cd", "jenkins", "terraform",
+                "docker", "kubernetes", "aws", "azure", "gcp",
+                "ci/cd", "jenkins", "terraform", "devops", "sre", "platform",
             ],
         }
 
-        def build_smart_answers(questionnaire: list, profile: dict) -> dict:
-            answers = {}
-
-            def pick_yes(options: dict) -> str:
-                # Prefer any option whose label contains "yes".
-                for k, v in options.items():
-                    if "yes" in v.lower():
-                        return k
-                return list(options.keys())[0]
-
-            def pick_notice(options: dict, notice_days: int) -> str:
-                # Match the closest notice period bucket to notice_days.
-                for k, v in options.items():
-                    val = v.lower()
-                    if "15" in val and notice_days <= 15:
-                        return k
-                    if "1 month" in val and notice_days <= 30:
-                        return k
-                    if "2 month" in val and notice_days <= 60:
-                        return k
-                return list(options.keys())[0]
-
-            for q in questionnaire:
-                qid   = q["questionId"]
-                qtext = (q.get("questionName") or "").lower()
-                qtype = (q.get("questionType") or "").lower()
-                options = q.get("answerOption") or {}
-
-                if qtype == "text box":
-                    if "current ctc" in qtext:
-                        ans = profile["current_ctc"]
-                    elif "expected ctc" in qtext:
-                        ans = profile["expected_ctc"]
-                    elif "experience" in qtext:
-                        if "node" in qtext:
-                            ans = profile["exp_node"]
-                        elif "python" in qtext:
-                            ans = profile["exp_python"]
-                        else:
-                            ans = profile["exp_total"]
-                    elif "notice" in qtext:
-                        ans = str(profile["notice_days"])
-                    else:
-                        ans = "1"
-
-                else:
-                    if options:
-                        if "notice" in qtext:
-                            key = pick_notice(options, profile["notice_days"])
-                        elif any(skill in qtext for skill in profile["skills"]):
-                            key = pick_yes(options)
-                        elif any(x in qtext for x in ["do you", "have you", "experience"]):
-                            key = pick_yes(options)
-                        else:
-                            key = list(options.keys())[0]
-
-                        # Option-type answers must always be wrapped in a list.
-                        ans = [key]
-                    else:
-                        ans = "1"
-
-                answers[qid] = ans
-
-            return answers
-
-        answers = build_smart_answers(questionnaire, PROFILE)
+        answers = build_questionnaire_answers(questionnaire, PROFILE)
         logger.debug("Generated answers: %s", answers)
 
         apply_src, logstr_template = APPLY_SRC_MAP.get(source, APPLY_SRC_MAP["recommended"])

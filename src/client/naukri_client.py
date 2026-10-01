@@ -7,7 +7,10 @@ from src.client.session import build_session
 from src.config.constants import *
 from src.exceptions.exceptions import *
 from src.models.models import *
+# from src.utils.extractors import extract_form_key2, extract_all_js_urls, extract_module_version
 from src.utils.extractors import extract_form_key2, extract_all_js_urls
+from src.utils.formkey import candidate_mnj_urls
+
 import requests
 from src.utils.request_helper import with_exponential_retry
 logger = logging.getLogger(__name__)
@@ -300,6 +303,58 @@ class NaukriLoginClient:
     def _fetch_profile_html_auth(self):
         return self.session.get(PROFILE_URL, headers=self._build_headers(auth=True))
 
+    # def get_form_key2(self):
+    #     if not self.naukri_session:
+    #         raise NaukriAuthError("Login first")
+
+    #     if "form_key" in self.cache:
+    #         return self.cache["form_key"]
+
+    #     res = self._fetch_profile_html_auth()
+    #     html = res.text
+    #     js_urls = extract_all_js_urls(html)
+    #     logger.debug("get_form_key2: profile html status=%s len=%d js_urls=%d", res.status_code, len(html), len(js_urls))
+    #     logger.debug("get_form_key2: js_urls=%s", js_urls)
+
+    #     for js_url in js_urls:
+    #         if "mnj" not in js_url:
+    #             continue
+    #         if js_url.startswith("//"):
+    #             js_url = "https:" + js_url
+    #         try:
+    #             js_content = self._fetch_js(js_url).text
+    #             key = extract_form_key2(js_content)
+    #             logger.debug("get_form_key2: tried mnj url from profile html %s found=%s", js_url, bool(key))
+    #             if key:
+    #                 self.cache["form_key"] = key
+    #                 return key
+    #         except Exception as e:
+    #             logger.debug("get_form_key2: fetch failed for %s: %s", js_url, e)
+    #             continue
+
+    #     try:
+    #         app_match = APP_JS_PATTERN.search(html)
+    #         logger.debug("get_form_key2: app_match=%s", bool(app_match))
+    #         if app_match:
+    #             app_js_url = app_match.group(1)
+    #             if app_js_url.startswith("//"):
+    #                 app_js_url = "https:" + app_js_url
+    #             app_js_content = self._fetch_js(app_js_url).text
+    #             mnj_version = extract_module_version(app_js_content, "mnj")
+    #             logger.debug("get_form_key2: app_js_url=%s mnj_version=%s", app_js_url, mnj_version)
+    #             if mnj_version:
+    #                 fallback_url = f"https://static.naukimg.com/s/5/105/j/mnj{mnj_version}.min.js"
+    #                 js_content = self._fetch_js(fallback_url).text
+    #                 key = extract_form_key2(js_content)
+    #                 logger.debug("get_form_key2: fallback_url=%s found=%s", fallback_url, bool(key))
+    #                 if key:
+    #                     self.cache["form_key"] = key
+    #                     return key
+    #     except Exception as e:
+    #         logger.debug("get_form_key2: fallback resolution failed: %s", e)
+
+    #     raise NaukriParseError("formKey2 not found")
+
     def get_form_key2(self):
         if not self.naukri_session:
             raise NaukriAuthError("Login first")
@@ -308,35 +363,102 @@ class NaukriLoginClient:
             return self.cache["form_key"]
 
         res = self._fetch_profile_html_auth()
+
+        if not res.ok:
+            raise NaukriParseError(
+                f"Profile page request failed: {res.status_code}"
+            )
+
         html = res.text
         js_urls = extract_all_js_urls(html)
 
+        logger.debug(
+            "get_form_key2: profile html status=%s len=%d js_urls=%d",
+            res.status_code,
+            len(html),
+            len(js_urls),
+        )
+
+        logger.debug("get_form_key2: js_urls=%s", js_urls)
+
+        # ------------------------------------------------------------
+        # 1. First try JS files directly referenced by the profile page
+        # ------------------------------------------------------------
         for js_url in js_urls:
-            if "mnj" not in js_url:
-                continue
             if js_url.startswith("//"):
                 js_url = "https:" + js_url
+
             try:
-                js_content = self._fetch_js(js_url).text
+                js_res = self._fetch_js(js_url)
+
+                if not js_res.ok:
+                    continue
+
+                js_content = js_res.text
                 key = extract_form_key2(js_content)
+
+                logger.debug(
+                    "get_form_key2: tried %s key=%r",
+                    js_url,
+                    key,
+                )
+
                 if key:
                     self.cache["form_key"] = key
                     return key
-            except Exception:
-                continue
 
+            except Exception as e:
+                logger.debug(
+                    "get_form_key2: fetch failed for %s: %s",
+                    js_url,
+                    e,
+                )
+
+        # ------------------------------------------------------------
+        # 2. Naukri may no longer expose the MNJ bundle in HTML.
+        #    Discover its version from the app bundle if available,
+        #    then try known fallback versions.
+        # ------------------------------------------------------------
         try:
-            fallback_url = "https://static.naukimg.com/s/5/105/j/mnj_v299.min.js"
-            js_content = self._fetch_js(fallback_url).text
-            key = extract_form_key2(js_content)
-            if key:
-                self.cache["form_key"] = key
-                return key
-        except Exception:
-            pass
+            mnj_urls = candidate_mnj_urls(
+                html,
+                lambda url: self._fetch_js(url).text,
+            )
+
+            logger.debug(
+                "get_form_key2: candidate MNJ URLs=%s",
+                mnj_urls,
+            )
+
+            for mnj_url in mnj_urls:
+                try:
+                    js_content = self._fetch_js(mnj_url).text
+                    key = extract_form_key2(js_content)
+
+                    logger.debug(
+                        "get_form_key2: tried MNJ %s found=%s",
+                        mnj_url,
+                        bool(key),
+                    )
+
+                    if key:
+                        self.cache["form_key"] = key
+                        return key
+
+                except Exception as e:
+                    logger.debug(
+                        "get_form_key2: MNJ fetch failed for %s: %s",
+                        mnj_url,
+                        e,
+                    )
+
+        except Exception as e:
+            logger.debug(
+                "get_form_key2: MNJ discovery failed: %s",
+                e,
+            )
 
         raise NaukriParseError("formKey2 not found")
-
     # ------------------------------------------------------------------
     # Profile ID
     # ------------------------------------------------------------------
